@@ -15,9 +15,6 @@ env:
   TSK_VERSION: "4.15.0"
   TSK_TAG: "sleuthkit-4.15.0"
 
-  # Pinned libyal releases.
-  # libvhdi latest release visible at time of writing: 20251119.
-  # libbfio latest release visible at time of writing: 20260623.
   LIBVHDI_VERSION: "20251119"
   LIBBFIO_VERSION: "20260623"
 
@@ -135,16 +132,26 @@ jobs:
           export LDFLAGS="-L${PREFIX}/lib -Wl,-rpath,${PREFIX}/lib -static-libstdc++ -static-libgcc"
           export LD_RUN_PATH="${PREFIX}/lib"
 
-          mkdir -p "${PREFIX}" /build/src
+          archive_topdir() {
+            tar -tzf "$1" | awk -F/ 'NF > 1 && $1 != "." { print $1; exit }'
+          }
 
+          mkdir -p "${PREFIX}" /build/src
           cd /build/src
 
+          echo "Downloading libbfio ${LIBBFIO_VERSION}"
           curl -fL \
             "https://github.com/libyal/libbfio/releases/download/${LIBBFIO_VERSION}/libbfio-alpha-${LIBBFIO_VERSION}.tar.gz" \
             -o libbfio.tar.gz
 
+          echo "libbfio archive top entries:"
+          tar -tzf libbfio.tar.gz | head -20
+
+          LIBBFIO_SRCDIR="$(archive_topdir libbfio.tar.gz)"
+          test -n "${LIBBFIO_SRCDIR}"
+
           tar -xzf libbfio.tar.gz
-          cd "libbfio-alpha-${LIBBFIO_VERSION}"
+          cd "${LIBBFIO_SRCDIR}"
 
           ./configure \
             --prefix="${PREFIX}" \
@@ -157,12 +164,19 @@ jobs:
 
           cd /build/src
 
+          echo "Downloading libvhdi ${LIBVHDI_VERSION}"
           curl -fL \
             "https://github.com/libyal/libvhdi/releases/download/${LIBVHDI_VERSION}/libvhdi-alpha-${LIBVHDI_VERSION}.tar.gz" \
             -o libvhdi.tar.gz
 
+          echo "libvhdi archive top entries:"
+          tar -tzf libvhdi.tar.gz | head -20
+
+          LIBVHDI_SRCDIR="$(archive_topdir libvhdi.tar.gz)"
+          test -n "${LIBVHDI_SRCDIR}"
+
           tar -xzf libvhdi.tar.gz
-          cd "libvhdi-alpha-${LIBVHDI_VERSION}"
+          cd "${LIBVHDI_SRCDIR}"
 
           ./configure \
             --prefix="${PREFIX}" \
@@ -215,6 +229,7 @@ jobs:
             --without-libvmdk \
             --without-libvslvm
 
+          echo "Checking configure result for libvhdi:"
           grep -R "HAVE_LIBVHDI" tsk/tsk_config.h config.log || {
             echo "ERROR: Sleuth Kit did not detect libvhdi"
             exit 1
@@ -302,7 +317,7 @@ jobs:
             export PATH=${PREFIX}/bin:\$PATH
             export LD_LIBRARY_PATH=${PREFIX}/lib:\$LD_LIBRARY_PATH
 
-          Recommended system package from RHEL 7.9 DVD if you want vhdimount:
+          Recommended system packages from RHEL 7.9 DVD if you want vhdimount:
 
             sudo yum install fuse fuse-libs
 
@@ -312,20 +327,24 @@ jobs:
             mmls -i vhdi disk.vhd
             fsstat -i vhdi -o <START_SECTOR> disk.vhd
             fls -i vhdi -o <START_SECTOR> disk.vhd
+            icat -i vhdi -o <START_SECTOR> disk.vhd <INODE>
 
-          For a raw/dd image:
+          For raw/dd images:
 
+            img_stat disk.raw
             mmls disk.raw
             fsstat -o <START_SECTOR> disk.raw
             fls -o <START_SECTOR> disk.raw
+            icat -o <START_SECTOR> disk.raw <INODE>
 
-          For FUSE mounting with libvhdi tools:
+          FUSE mounting with libvhdi tools:
 
             mkdir /mnt/vhdi
             vhdimount disk.vhd /mnt/vhdi
             ls -l /mnt/vhdi
 
-          The mounted raw-like device is usually visible as:
+          The exposed raw-like file is usually:
+
             /mnt/vhdi/vhdi1
 
           Then use Sleuth Kit on that exposed image:
@@ -382,5 +401,5 @@ jobs:
           else
             gh release create "${release_tag}" dist/* \
               --title "${ARTIFACT}" \
-              --notes "Sleuth Kit ${TSK_VERSION} command-line binaries with libvhdi VHD support, built for RHEL 7.x x86_64 compatibility."
+              --notes "Sleuth Kit ${TSK_VERSION} command-line binaries with libvhdi VHD/VHDX support, built for RHEL 7.x x86_64 compatibility."
           fi
