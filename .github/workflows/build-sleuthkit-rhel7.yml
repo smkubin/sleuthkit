@@ -1,0 +1,386 @@
+name: Build Sleuth Kit 4.15.0 with VHD support for RHEL 7 x86_64
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Also attach tarball to a GitHub Release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  TSK_VERSION: "4.15.0"
+  TSK_TAG: "sleuthkit-4.15.0"
+
+  # Pinned libyal releases.
+  # libvhdi latest release visible at time of writing: 20251119.
+  # libbfio latest release visible at time of writing: 20260623.
+  LIBVHDI_VERSION: "20251119"
+  LIBBFIO_VERSION: "20260623"
+
+  ARTIFACT: "sleuthkit-4.15.0-libvhdi-rhel7-x86_64"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Build inside CentOS 7-compatible container
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist work
+
+          cat > work/Dockerfile <<'EOF'
+          # syntax=docker/dockerfile:1.6
+          FROM quay.io/centos/centos:7
+
+          SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+          ARG TSK_VERSION
+          ARG TSK_TAG
+          ARG LIBVHDI_VERSION
+          ARG LIBBFIO_VERSION
+          ARG ARTIFACT
+
+          ENV PREFIX="/opt/sleuthkit-${TSK_VERSION}"
+
+          RUN <<'BASH'
+          set -eux
+
+          cat > /etc/yum.repos.d/CentOS-Base.repo <<'REPO'
+          [base]
+          name=CentOS 7.9.2009 - Base
+          baseurl=https://vault.centos.org/7.9.2009/os/$basearch/
+          enabled=1
+          gpgcheck=0
+
+          [updates]
+          name=CentOS 7.9.2009 - Updates
+          baseurl=https://vault.centos.org/7.9.2009/updates/$basearch/
+          enabled=1
+          gpgcheck=0
+
+          [extras]
+          name=CentOS 7.9.2009 - Extras
+          baseurl=https://vault.centos.org/7.9.2009/extras/$basearch/
+          enabled=1
+          gpgcheck=0
+          REPO
+
+          cat > /etc/yum.repos.d/CentOS-SCLo.repo <<'REPO'
+          [centos-sclo-rh]
+          name=CentOS 7.9.2009 - SCLo rh
+          baseurl=https://vault.centos.org/7.9.2009/sclo/$basearch/rh/
+          enabled=1
+          gpgcheck=0
+
+          [centos-sclo-sclo]
+          name=CentOS 7.9.2009 - SCLo sclo
+          baseurl=https://vault.centos.org/7.9.2009/sclo/$basearch/sclo/
+          enabled=1
+          gpgcheck=0
+          REPO
+
+          yum -y install \
+            ca-certificates \
+            curl \
+            git \
+            make \
+            perl \
+            which \
+            file \
+            findutils \
+            tar \
+            gzip \
+            xz \
+            binutils \
+            autoconf \
+            automake \
+            libtool \
+            pkgconfig \
+            zlib-devel \
+            fuse-devel \
+            gettext-devel
+
+          yum -y install devtoolset-11-gcc-c++ \
+            || yum -y install devtoolset-10-gcc-c++ \
+            || yum -y install devtoolset-9-gcc-c++ \
+            || yum -y install devtoolset-8-gcc-c++
+
+          yum clean all
+          BASH
+
+          WORKDIR /build
+
+          RUN <<'BASH'
+          set -eux
+
+          DTS="$(ls -d /opt/rh/devtoolset-* | sort -V | tail -1)"
+          source "${DTS}/enable"
+
+          gcc --version
+          g++ --version
+
+          export PATH="${PREFIX}/bin:${PATH}"
+          export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig:${PREFIX}/share/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export LD_LIBRARY_PATH="${PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+          export CPPFLAGS="-I${PREFIX}/include"
+          export CFLAGS="-O2 -pipe"
+          export CXXFLAGS="-O2 -pipe"
+          export LDFLAGS="-L${PREFIX}/lib -Wl,-rpath,${PREFIX}/lib -static-libstdc++ -static-libgcc"
+          export LD_RUN_PATH="${PREFIX}/lib"
+
+          mkdir -p "${PREFIX}" /build/src
+
+          cd /build/src
+
+          curl -fL \
+            "https://github.com/libyal/libbfio/releases/download/${LIBBFIO_VERSION}/libbfio-alpha-${LIBBFIO_VERSION}.tar.gz" \
+            -o libbfio.tar.gz
+
+          tar -xzf libbfio.tar.gz
+          cd "libbfio-alpha-${LIBBFIO_VERSION}"
+
+          ./configure \
+            --prefix="${PREFIX}" \
+            --enable-shared \
+            --enable-static \
+            --disable-python
+
+          make -j"$(nproc)"
+          make install
+
+          cd /build/src
+
+          curl -fL \
+            "https://github.com/libyal/libvhdi/releases/download/${LIBVHDI_VERSION}/libvhdi-alpha-${LIBVHDI_VERSION}.tar.gz" \
+            -o libvhdi.tar.gz
+
+          tar -xzf libvhdi.tar.gz
+          cd "libvhdi-alpha-${LIBVHDI_VERSION}"
+
+          ./configure \
+            --prefix="${PREFIX}" \
+            --with-libbfio="${PREFIX}" \
+            --enable-shared \
+            --enable-static \
+            --enable-tools \
+            --disable-python
+
+          make -j"$(nproc)"
+          make install
+
+          echo "${PREFIX}/lib" > /etc/ld.so.conf.d/sleuthkit.conf
+          ldconfig
+
+          vhdiinfo -V
+          vhdimount -V
+          BASH
+
+          RUN git clone --depth 1 --branch "${TSK_TAG}" \
+              https://github.com/sleuthkit/sleuthkit.git /build/sleuthkit
+
+          RUN <<'BASH'
+          set -eux
+
+          DTS="$(ls -d /opt/rh/devtoolset-* | sort -V | tail -1)"
+          source "${DTS}/enable"
+
+          export PATH="${PREFIX}/bin:${PATH}"
+          export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig:${PREFIX}/share/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export LD_LIBRARY_PATH="${PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+          export CPPFLAGS="-I${PREFIX}/include"
+          export CFLAGS="-O2 -pipe"
+          export CXXFLAGS="-O2 -pipe"
+          export LDFLAGS="-L${PREFIX}/lib -Wl,-rpath,${PREFIX}/lib -static-libstdc++ -static-libgcc"
+          export LD_RUN_PATH="${PREFIX}/lib"
+
+          cd /build/sleuthkit
+
+          ./bootstrap
+
+          ./configure \
+            --prefix="${PREFIX}" \
+            --disable-java \
+            --disable-cppunit \
+            --without-afflib \
+            --without-ewf \
+            --with-libbfio="${PREFIX}" \
+            --with-libvhdi="${PREFIX}" \
+            --without-libvmdk \
+            --without-libvslvm
+
+          grep -R "HAVE_LIBVHDI" tsk/tsk_config.h config.log || {
+            echo "ERROR: Sleuth Kit did not detect libvhdi"
+            exit 1
+          }
+
+          make -j"$(nproc)"
+          make install
+
+          ldconfig
+
+          echo "Sleuth Kit version checks:"
+          fls -V
+          mmls -V
+          img_stat -V
+          tsk_recover -V
+
+          echo "libvhdi tool checks:"
+          vhdiinfo -V
+          vhdimount -V
+
+          echo "Checking that Sleuth Kit links to libvhdi:"
+          ldd "${PREFIX}/bin/img_stat" | tee /tmp/img_stat.ldd
+          ldd "${PREFIX}/lib/libtsk.so" | tee /tmp/libtsk.ldd || true
+
+          if ! grep -q "libvhdi" /tmp/img_stat.ldd /tmp/libtsk.ldd; then
+            echo "ERROR: libvhdi is not visible in ldd output"
+            exit 1
+          fi
+
+          echo "Checking for GLIBC newer than RHEL 7 / glibc 2.17:"
+          bad=0
+
+          while IFS= read -r f; do
+            if file "$f" | grep -qE 'ELF .* (executable|shared object)'; then
+              if objdump -T "$f" 2>/dev/null | grep -Eq 'GLIBC_2\.(1[89]|[2-9][0-9])'; then
+                echo "ERROR: $f requires GLIBC newer than 2.17"
+                objdump -T "$f" | grep -E 'GLIBC_2\.(1[89]|[2-9][0-9])' || true
+                bad=1
+              fi
+
+              if ldd "$f" 2>/dev/null | grep -Eq '/opt/rh/devtoolset|libstdc\+\+|libgcc_s'; then
+                echo "ERROR: $f still depends on devtoolset/libstdc++ runtime"
+                ldd "$f" || true
+                bad=1
+              fi
+            fi
+          done < <(find "${PREFIX}" -type f)
+
+          test "$bad" -eq 0
+
+          strip "${PREFIX}"/bin/* || true
+          find "${PREFIX}" -type f -name '*.so*' \
+            -exec strip --strip-unneeded {} + || true
+
+          cat > "${PREFIX}/README.rhel7-vhd.txt" <<README
+          Sleuth Kit ${TSK_VERSION} for RHEL 7.9 x86_64 with VHD support
+
+          Installed prefix:
+            ${PREFIX}
+
+          Included:
+            - Sleuth Kit ${TSK_VERSION}
+            - libbfio ${LIBBFIO_VERSION}
+            - libvhdi ${LIBVHDI_VERSION}
+            - vhdiinfo
+            - vhdimount
+
+          Enabled:
+            - raw/dd image support
+            - NTFS/FAT/ext/XFS/etc through Sleuth Kit
+            - VHD/VHDX support through libvhdi
+            - fixed, dynamic/sparse, and differencing VHD images through libvhdi
+
+          Disabled:
+            - Java bindings
+            - CppUnit tests
+            - AFF image support
+            - EWF/E01 image support
+            - VMDK image support
+            - LVM pool support through libvslvm
+
+          Install on disconnected RHEL 7.9:
+
+            sudo tar -C / -xzf ${ARTIFACT}.tar.gz
+            export PATH=${PREFIX}/bin:\$PATH
+            export LD_LIBRARY_PATH=${PREFIX}/lib:\$LD_LIBRARY_PATH
+
+          Recommended system package from RHEL 7.9 DVD if you want vhdimount:
+
+            sudo yum install fuse fuse-libs
+
+          Direct Sleuth Kit use against VHD:
+
+            img_stat -i vhdi disk.vhd
+            mmls -i vhdi disk.vhd
+            fsstat -i vhdi -o <START_SECTOR> disk.vhd
+            fls -i vhdi -o <START_SECTOR> disk.vhd
+
+          For a raw/dd image:
+
+            mmls disk.raw
+            fsstat -o <START_SECTOR> disk.raw
+            fls -o <START_SECTOR> disk.raw
+
+          For FUSE mounting with libvhdi tools:
+
+            mkdir /mnt/vhdi
+            vhdimount disk.vhd /mnt/vhdi
+            ls -l /mnt/vhdi
+
+          The mounted raw-like device is usually visible as:
+            /mnt/vhdi/vhdi1
+
+          Then use Sleuth Kit on that exposed image:
+
+            mmls /mnt/vhdi/vhdi1
+
+          Runtime check:
+
+            ldd ${PREFIX}/bin/img_stat
+            ldd ${PREFIX}/lib/libtsk.so
+          README
+
+          tar -C / -czf "/${ARTIFACT}.tar.gz" "opt/sleuthkit-${TSK_VERSION}"
+          BASH
+          EOF
+
+          DOCKER_BUILDKIT=1 docker build \
+            --build-arg TSK_VERSION="${TSK_VERSION}" \
+            --build-arg TSK_TAG="${TSK_TAG}" \
+            --build-arg LIBVHDI_VERSION="${LIBVHDI_VERSION}" \
+            --build-arg LIBBFIO_VERSION="${LIBBFIO_VERSION}" \
+            --build-arg ARTIFACT="${ARTIFACT}" \
+            -t "${ARTIFACT}:build" \
+            work
+
+          cid="$(docker create "${ARTIFACT}:build")"
+          docker cp "${cid}:/${ARTIFACT}.tar.gz" "dist/${ARTIFACT}.tar.gz"
+          docker rm "${cid}"
+
+          sha256sum "dist/${ARTIFACT}.tar.gz" | tee "dist/${ARTIFACT}.tar.gz.sha256"
+
+          echo "Package contents:"
+          tar -tzf "dist/${ARTIFACT}.tar.gz" | head -80
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          release_tag="${ARTIFACT}"
+
+          if gh release view "${release_tag}" >/dev/null 2>&1; then
+            gh release upload "${release_tag}" dist/* --clobber
+          else
+            gh release create "${release_tag}" dist/* \
+              --title "${ARTIFACT}" \
+              --notes "Sleuth Kit ${TSK_VERSION} command-line binaries with libvhdi VHD support, built for RHEL 7.x x86_64 compatibility."
+          fi
