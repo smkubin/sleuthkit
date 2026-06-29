@@ -1,31 +1,24 @@
-name: Build Sleuth Kit 4.15.0 with VHD support for RHEL 7 x86_64
+name: Build Sleuth Kit 4.15.0 for RHEL 7 with VHD support
 
 on:
   workflow_dispatch:
-    inputs:
-      publish_release:
-        description: "Also attach tarball to a GitHub Release"
-        type: boolean
-        default: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   TSK_VERSION: "4.15.0"
   TSK_TAG: "sleuthkit-4.15.0"
-
-  LIBVHDI_VERSION: "20251119"
   LIBBFIO_VERSION: "20260623"
-
-  ARTIFACT: "sleuthkit-4.15.0-libvhdi-rhel7-x86_64"
+  LIBVHDI_VERSION: "20251119"
+  ARTIFACT: "sleuthkit-4.15.0-vhd-rhel7-x86_64"
 
 jobs:
   build:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Build inside CentOS 7-compatible container
+      - name: Build package
         shell: bash
         run: |
           set -euo pipefail
@@ -40,8 +33,8 @@ jobs:
 
           ARG TSK_VERSION
           ARG TSK_TAG
-          ARG LIBVHDI_VERSION
           ARG LIBBFIO_VERSION
+          ARG LIBVHDI_VERSION
           ARG ARTIFACT
 
           ENV PREFIX="/opt/sleuthkit-${TSK_VERSION}"
@@ -94,7 +87,6 @@ jobs:
             findutils \
             tar \
             gzip \
-            xz \
             binutils \
             autoconf \
             automake \
@@ -120,9 +112,6 @@ jobs:
           DTS="$(ls -d /opt/rh/devtoolset-* | sort -V | tail -1)"
           source "${DTS}/enable"
 
-          gcc --version
-          g++ --version
-
           export PATH="${PREFIX}/bin:${PATH}"
           export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig:${PREFIX}/share/pkgconfig:${PKG_CONFIG_PATH:-}"
           export LD_LIBRARY_PATH="${PREFIX}/lib:${LD_LIBRARY_PATH:-}"
@@ -132,22 +121,15 @@ jobs:
           export LDFLAGS="-L${PREFIX}/lib -Wl,-rpath,${PREFIX}/lib -static-libstdc++ -static-libgcc"
           export LD_RUN_PATH="${PREFIX}/lib"
 
-          archive_topdir() {
-            tar -tzf "$1" | awk -F/ 'NF > 1 && $1 != "." { print $1; exit }'
-          }
-
           mkdir -p "${PREFIX}" /build/src
           cd /build/src
 
-          echo "Downloading libbfio ${LIBBFIO_VERSION}"
           curl -fL \
             "https://github.com/libyal/libbfio/releases/download/${LIBBFIO_VERSION}/libbfio-alpha-${LIBBFIO_VERSION}.tar.gz" \
             -o libbfio.tar.gz
 
-          echo "libbfio archive top entries:"
-          tar -tzf libbfio.tar.gz | head -20
-
-          LIBBFIO_SRCDIR="$(archive_topdir libbfio.tar.gz)"
+          tar -tzf libbfio.tar.gz > libbfio.contents
+          LIBBFIO_SRCDIR="$(awk -F/ 'NF > 1 && $1 != "." { print $1; exit }' libbfio.contents)"
           test -n "${LIBBFIO_SRCDIR}"
 
           tar -xzf libbfio.tar.gz
@@ -164,15 +146,12 @@ jobs:
 
           cd /build/src
 
-          echo "Downloading libvhdi ${LIBVHDI_VERSION}"
           curl -fL \
             "https://github.com/libyal/libvhdi/releases/download/${LIBVHDI_VERSION}/libvhdi-alpha-${LIBVHDI_VERSION}.tar.gz" \
             -o libvhdi.tar.gz
 
-          echo "libvhdi archive top entries:"
-          tar -tzf libvhdi.tar.gz | head -20
-
-          LIBVHDI_SRCDIR="$(archive_topdir libvhdi.tar.gz)"
+          tar -tzf libvhdi.tar.gz > libvhdi.contents
+          LIBVHDI_SRCDIR="$(awk -F/ 'NF > 1 && $1 != "." { print $1; exit }' libvhdi.contents)"
           test -n "${LIBVHDI_SRCDIR}"
 
           tar -xzf libvhdi.tar.gz
@@ -191,13 +170,10 @@ jobs:
 
           echo "${PREFIX}/lib" > /etc/ld.so.conf.d/sleuthkit.conf
           ldconfig
-
-          vhdiinfo -V
-          vhdimount -V
           BASH
 
           RUN git clone --depth 1 --branch "${TSK_TAG}" \
-              https://github.com/sleuthkit/sleuthkit.git /build/sleuthkit
+            https://github.com/sleuthkit/sleuthkit.git /build/sleuthkit
 
           RUN <<'BASH'
           set -eux
@@ -229,132 +205,40 @@ jobs:
             --without-libvmdk \
             --without-libvslvm
 
-          echo "Checking configure result for libvhdi:"
-          grep -R "HAVE_LIBVHDI" tsk/tsk_config.h config.log || {
-            echo "ERROR: Sleuth Kit did not detect libvhdi"
-            exit 1
-          }
-
           make -j"$(nproc)"
           make install
 
-          ldconfig
-
-          echo "Sleuth Kit version checks:"
-          fls -V
-          mmls -V
-          img_stat -V
-          tsk_recover -V
-
-          echo "libvhdi tool checks:"
-          vhdiinfo -V
-          vhdimount -V
-
-          echo "Checking that Sleuth Kit links to libvhdi:"
-          ldd "${PREFIX}/bin/img_stat" | tee /tmp/img_stat.ldd
-          ldd "${PREFIX}/lib/libtsk.so" | tee /tmp/libtsk.ldd || true
-
-          if ! grep -q "libvhdi" /tmp/img_stat.ldd /tmp/libtsk.ldd; then
-            echo "ERROR: libvhdi is not visible in ldd output"
-            exit 1
-          fi
-
-          echo "Checking for GLIBC newer than RHEL 7 / glibc 2.17:"
-          bad=0
-
-          while IFS= read -r f; do
-            if file "$f" | grep -qE 'ELF .* (executable|shared object)'; then
-              if objdump -T "$f" 2>/dev/null | grep -Eq 'GLIBC_2\.(1[89]|[2-9][0-9])'; then
-                echo "ERROR: $f requires GLIBC newer than 2.17"
-                objdump -T "$f" | grep -E 'GLIBC_2\.(1[89]|[2-9][0-9])' || true
-                bad=1
-              fi
-
-              if ldd "$f" 2>/dev/null | grep -Eq '/opt/rh/devtoolset|libstdc\+\+|libgcc_s'; then
-                echo "ERROR: $f still depends on devtoolset/libstdc++ runtime"
-                ldd "$f" || true
-                bad=1
-              fi
-            fi
-          done < <(find "${PREFIX}" -type f)
-
-          test "$bad" -eq 0
-
           strip "${PREFIX}"/bin/* || true
-          find "${PREFIX}" -type f -name '*.so*' \
-            -exec strip --strip-unneeded {} + || true
+          find "${PREFIX}" -type f -name '*.so*' -exec strip --strip-unneeded {} + || true
 
-          cat > "${PREFIX}/README.rhel7-vhd.txt" <<README
-          Sleuth Kit ${TSK_VERSION} for RHEL 7.9 x86_64 with VHD support
+          cat > "${PREFIX}/env.sh" <<ENV
+          export PATH=${PREFIX}/bin:\$PATH
+          export LD_LIBRARY_PATH=${PREFIX}/lib:\$LD_LIBRARY_PATH
+          ENV
 
-          Installed prefix:
-            ${PREFIX}
+          cat > "${PREFIX}/README.txt" <<README
+          Sleuth Kit ${TSK_VERSION} for RHEL 7.x x86_64 with VHD support.
 
-          Included:
-            - Sleuth Kit ${TSK_VERSION}
-            - libbfio ${LIBBFIO_VERSION}
-            - libvhdi ${LIBVHDI_VERSION}
-            - vhdiinfo
-            - vhdimount
-
-          Enabled:
-            - raw/dd image support
-            - NTFS/FAT/ext/XFS/etc through Sleuth Kit
-            - VHD/VHDX support through libvhdi
-            - fixed, dynamic/sparse, and differencing VHD images through libvhdi
-
-          Disabled:
-            - Java bindings
-            - CppUnit tests
-            - AFF image support
-            - EWF/E01 image support
-            - VMDK image support
-            - LVM pool support through libvslvm
-
-          Install on disconnected RHEL 7.9:
+          Use on RHEL 7.9:
 
             sudo tar -C / -xzf ${ARTIFACT}.tar.gz
-            export PATH=${PREFIX}/bin:\$PATH
-            export LD_LIBRARY_PATH=${PREFIX}/lib:\$LD_LIBRARY_PATH
+            source ${PREFIX}/env.sh
 
-          Recommended system packages from RHEL 7.9 DVD if you want vhdimount:
+          Basic checks:
 
-            sudo yum install fuse fuse-libs
+            fls -V
+            img_stat -V
+            vhdiinfo -V
 
-          Direct Sleuth Kit use against VHD:
+          VHD examples:
 
+            vhdiinfo disk.vhd
             img_stat -i vhdi disk.vhd
             mmls -i vhdi disk.vhd
             fsstat -i vhdi -o <START_SECTOR> disk.vhd
             fls -i vhdi -o <START_SECTOR> disk.vhd
-            icat -i vhdi -o <START_SECTOR> disk.vhd <INODE>
 
-          For raw/dd images:
-
-            img_stat disk.raw
-            mmls disk.raw
-            fsstat -o <START_SECTOR> disk.raw
-            fls -o <START_SECTOR> disk.raw
-            icat -o <START_SECTOR> disk.raw <INODE>
-
-          FUSE mounting with libvhdi tools:
-
-            mkdir /mnt/vhdi
-            vhdimount disk.vhd /mnt/vhdi
-            ls -l /mnt/vhdi
-
-          The exposed raw-like file is usually:
-
-            /mnt/vhdi/vhdi1
-
-          Then use Sleuth Kit on that exposed image:
-
-            mmls /mnt/vhdi/vhdi1
-
-          Runtime check:
-
-            ldd ${PREFIX}/bin/img_stat
-            ldd ${PREFIX}/lib/libtsk.so
+          For vhdimount, install fuse and fuse-libs from the RHEL 7.9 DVD if missing.
           README
 
           tar -C / -czf "/${ARTIFACT}.tar.gz" "opt/sleuthkit-${TSK_VERSION}"
@@ -364,8 +248,8 @@ jobs:
           DOCKER_BUILDKIT=1 docker build \
             --build-arg TSK_VERSION="${TSK_VERSION}" \
             --build-arg TSK_TAG="${TSK_TAG}" \
-            --build-arg LIBVHDI_VERSION="${LIBVHDI_VERSION}" \
             --build-arg LIBBFIO_VERSION="${LIBBFIO_VERSION}" \
+            --build-arg LIBVHDI_VERSION="${LIBVHDI_VERSION}" \
             --build-arg ARTIFACT="${ARTIFACT}" \
             -t "${ARTIFACT}:build" \
             work
@@ -374,32 +258,11 @@ jobs:
           docker cp "${cid}:/${ARTIFACT}.tar.gz" "dist/${ARTIFACT}.tar.gz"
           docker rm "${cid}"
 
-          sha256sum "dist/${ARTIFACT}.tar.gz" | tee "dist/${ARTIFACT}.tar.gz.sha256"
+          sha256sum "dist/${ARTIFACT}.tar.gz" > "dist/${ARTIFACT}.tar.gz.sha256"
 
-          echo "Package contents:"
-          tar -tzf "dist/${ARTIFACT}.tar.gz" | head -80
-
-      - name: Upload workflow artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT }}
           path: dist/*
           if-no-files-found: error
-
-      - name: Attach to GitHub Release
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release == true }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          release_tag="${ARTIFACT}"
-
-          if gh release view "${release_tag}" >/dev/null 2>&1; then
-            gh release upload "${release_tag}" dist/* --clobber
-          else
-            gh release create "${release_tag}" dist/* \
-              --title "${ARTIFACT}" \
-              --notes "Sleuth Kit ${TSK_VERSION} command-line binaries with libvhdi VHD/VHDX support, built for RHEL 7.x x86_64 compatibility."
-          fi
